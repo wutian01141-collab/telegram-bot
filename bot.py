@@ -201,6 +201,18 @@ def init_db():
     conn.close()
 
 
+def reset_all_data():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM attendance")
+    cur.execute("DELETE FROM checkins")
+    cur.execute("DELETE FROM members")
+    cur.execute("DELETE FROM chats")
+    cur.execute("DELETE FROM settings")
+    conn.commit()
+    conn.close()
+
+
 # =========================
 # 时间工具
 # =========================
@@ -247,6 +259,23 @@ def in_formal_work_hours(dt: datetime | None = None) -> bool:
     dt = dt or now_dt()
     t = dt.time()
     return t >= WORK_START or t <= WORK_END
+
+
+def get_formal_work_start_dt(dt: datetime | None = None) -> datetime:
+    dt = dt or now_dt()
+    base_date = dt.date()
+    if dt.time() < RESET_TIME:
+        base_date = base_date - timedelta(days=1)
+    return datetime.combine(base_date, WORK_START, tzinfo=LOCAL_TZ)
+
+
+def get_formal_work_end_dt(dt: datetime | None = None) -> datetime:
+    dt = dt or now_dt()
+    base_date = dt.date()
+    if dt.time() < RESET_TIME:
+        base_date = base_date - timedelta(days=1)
+    end_date = base_date + timedelta(days=1)
+    return datetime.combine(end_date, WORK_END, tzinfo=LOCAL_TZ)
 
 
 def seconds_between(start_iso: str, end_iso: str) -> int:
@@ -305,8 +334,6 @@ def extract_action(text: str):
 
 def is_return_text(text: str) -> bool:
     text = normalize_text(text)
-    if text in {"✅ 回座 back", "回座 back"}:
-        return True
     return any(contains_phrase(text, word) for word in RETURN_WORDS)
 
 
@@ -1013,7 +1040,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/me 查看我的离岗次数和时长\n"
         "/status 查看当前配置\n"
         "/export 导出日报\n"
-        "/cancel 取消当前离岗"
+        "/cancel 取消当前离岗\n"
+        "/resetall 管理员清空所有记录并重新开始"
     )
     await send_reply(update, msg)
 
@@ -1091,6 +1119,31 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_reply(update, f"已取消当前离岗 / Cancelled：{row['action']}")
 
 
+async def resetall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_group_admin(update, context):
+        await send_reply(update, "❌ 只有管理员可以执行 /resetall")
+        return
+
+    chat = update.effective_chat
+    user = update.effective_user
+
+    reset_all_data()
+    ensure_chat(chat.id, chat.title or chat.full_name or str(chat.id), chat.type)
+    ensure_member(chat.id, user)
+    ensure_default_settings(chat.id)
+    ensure_scheduled_for_chat(context.application, chat.id)
+
+    await send_reply(
+        update,
+        (
+            "🧹 <b>所有记录已清除 / All records cleared</b>\n\n"
+            "✅ 打卡数据、离岗数据、成员记录、群记录、设置已重置\n"
+            "✅ 系统已重新开始\n\n"
+            "你现在可以重新打卡 / You can start again now."
+        ),
+    )
+
+
 # =========================
 # 核心逻辑
 # =========================
@@ -1140,7 +1193,7 @@ async def process_action(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
     if not action:
         return
 
-    # 上下班时间限制：只限制可打卡时间
+    # 上下班仅限制在可打卡时间内
     if action in ["上班", "下班"] and not in_checkin_hours():
         await send_reply(
             update,
@@ -1160,9 +1213,18 @@ async def process_action(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
         now = now_dt()
         create_or_update_on_duty(chat_id, user_id, username, full_name, now.isoformat(), period_key)
 
-        warning = ""
+        formal_start_dt = get_formal_work_start_dt(now)
+
+        late_text = ""
+        if now > formal_start_dt:
+            late_seconds = int((now - formal_start_dt).total_seconds())
+            late_text = f"\n⚠️ 迟到 / Late：{format_seconds(late_seconds)}"
+        else:
+            late_text = "\n✅ 正常上班 / On time"
+
+        extra_warning = ""
         if not in_formal_work_hours():
-            warning = "\n⚠️ 非正式上班时间 / Outside formal work hours (21:00 - 10:00)"
+            extra_warning = "\n⚠️ 非正式上班时间 / Outside formal work hours (21:00 - 10:00)"
 
         await send_reply(
             update,
@@ -1171,8 +1233,9 @@ async def process_action(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
                 f"👤 {safe_text(full_name)}\n"
                 f"🕒 时间 / Time：{fmt_dt(now)}\n"
                 f"📅 周期 / Period：{period_key}\n"
-                f"⏰ 正式时间 / Formal work hours：21:00 - 次日10:00"
-                f"{warning}"
+                f"⏰ 正式上班时间 / Formal start：21:00"
+                f"{late_text}"
+                f"{extra_warning}"
             ),
         )
         return
@@ -1197,6 +1260,15 @@ async def process_action(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
         set_off_duty(chat_id, user_id, now.isoformat(), work_seconds, period_key)
         per_action, total_count, total_seconds = get_user_break_summary(chat_id, user_id, period_key)
 
+        formal_end_dt = get_formal_work_end_dt(now)
+
+        early_text = ""
+        if now < formal_end_dt:
+            early_seconds = int((formal_end_dt - now).total_seconds())
+            early_text = f"\n⚠️ 早退 / Early leave：{format_seconds(early_seconds)}"
+        else:
+            early_text = "\n✅ 正常下班 / Normal off duty"
+
         await send_reply(
             update,
             (
@@ -1209,6 +1281,7 @@ async def process_action(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
                 f"🧾 上厕所 / Toilet：{per_action['上厕所']['count']} 次，{format_seconds(per_action['上厕所']['seconds'])}\n"
                 f"🧾 抽烟 / Smoke：{per_action['抽烟']['count']} 次，{format_seconds(per_action['抽烟']['seconds'])}\n"
                 f"⌛ 本周期离岗总时长 / Total break time：{format_seconds(total_seconds)}"
+                f"{early_text}"
             ),
         )
         return
@@ -1327,6 +1400,7 @@ def main():
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("export", export_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler("resetall", resetall_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     logger.info("Thailand enterprise checkin bot is running...")
