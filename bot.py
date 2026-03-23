@@ -48,8 +48,8 @@ REMINDER_REPEAT_MINUTES = 10
 
 # 默认超时设置（分钟）
 DEFAULT_TIMEOUTS = {
-    "吃饭": 30,
-    "上厕所": 15,
+    "吃饭": 15,
+    "上厕所": 10,
     "抽烟": 10,
 }
 
