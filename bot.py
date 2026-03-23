@@ -34,7 +34,7 @@ DB_FILE = "enterprise_checkin.db"
 # 泰国时间
 LOCAL_TZ = ZoneInfo("Asia/Bangkok")
 
-# 上班时间：泰国时间 21:00 - 次日 10:00
+# 打卡时间：泰国时间 20:00 - 次日 11:30
 WORK_START = time(21, 0)
 WORK_END = time(10, 0)
 
