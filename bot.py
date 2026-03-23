@@ -10,12 +10,7 @@ from collections import defaultdict
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
-from telegram import (
-    Update,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-    InputFile,
-)
+from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, InputFile
 from telegram.constants import ParseMode, ChatType
 from telegram.ext import (
     Application,
@@ -36,17 +31,21 @@ if not BOT_TOKEN:
 DB_FILE = "enterprise_checkin.db"
 LOCAL_TZ = ZoneInfo("Asia/Bangkok")
 
-# 上班可打卡时间：泰国时间 20:00 - 次日12:00
-WORK_START = time(20, 0)
-WORK_END = time(12, 0)
+# 可打卡时间：20:00 - 次日12:00（泰国时间）
+CHECK_START = time(20, 0)
+CHECK_END = time(12, 0)
 
-# 每天中午12:00 切换统计周期
+# 正式上下班时间：21:00 - 次日10:00（泰国时间）
+WORK_START = time(21, 0)
+WORK_END = time(10, 0)
+
+# 每天中午12:00 切换统计周期并自动导出上一周期
 RESET_TIME = time(12, 0)
 
-# 每天晚上21:10 检查未打上班卡
+# 每天晚上21:10 检查未打上班卡成员
 ABSENCE_CHECK_TIME = time(21, 10)
 
-# 导出只允许管理员
+# 导出仅管理员
 EXPORT_ADMIN_ONLY = True
 
 # 超时前多久提醒本人（秒）
@@ -67,9 +66,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("th-checkin-bot")
 
-
 # =========================
-# 中英文识别
+# 中英识别
 # =========================
 ACTION_KEYWORDS = {
     "上班": [
@@ -81,7 +79,7 @@ ACTION_KEYWORDS = {
         "off", "off duty", "clock out", "off work", "check out",
     ],
     "吃饭": [
-        "吃饭", "去吃饭", "干饭", "吃个饭", "吃东西",
+        "吃饭", "去吃饭", "干饭", "吃个饭", "吃东西", "吃午饭", "吃晚饭",
         "eat", "eating", "meal", "lunch", "dinner", "go eat",
     ],
     "上厕所": [
@@ -102,20 +100,21 @@ RETURN_WORDS = [
 
 
 # =========================
-# 输入框下方按钮
+# 输入框按钮
 # =========================
 def get_main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton("上班 On"), KeyboardButton("下班 Off")],
-            [KeyboardButton("吃饭 Eat"), KeyboardButton("上厕所 Toilet")],
-            [KeyboardButton("抽烟 Smoke"), KeyboardButton("回座 Back")],
-            [KeyboardButton("/me"), KeyboardButton("/today")],
-            [KeyboardButton("/attendance"), KeyboardButton("/export")],
+            [KeyboardButton("🟢 上班 On"), KeyboardButton("🔴 下班 Off")],
+            [KeyboardButton("🍚 吃饭 Eat"), KeyboardButton("🚽 上厕所 Toilet")],
+            [KeyboardButton("🚬 抽烟 Smoke"), KeyboardButton("✅ 回座 Back")],
+            [KeyboardButton("📊 我的 /me"), KeyboardButton("📅 今日 /today")],
+            [KeyboardButton("🕘 出勤 /attendance"), KeyboardButton("📤 导出 /export")],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
         selective=False,
+        input_field_placeholder="请选择按钮 / Choose an action",
     )
 
 
@@ -225,6 +224,7 @@ def format_seconds(total_seconds: int) -> str:
 
 def current_period_key(dt: datetime | None = None) -> str:
     dt = dt or now_dt()
+    # 每天12:00前仍属于前一天周期
     if dt.time() < RESET_TIME:
         target = dt.date() - timedelta(days=1)
     else:
@@ -237,10 +237,15 @@ def previous_period_key(dt: datetime | None = None) -> str:
     return current_period_key(dt - timedelta(seconds=1))
 
 
-def in_working_hours(dt: datetime | None = None) -> bool:
+def in_checkin_hours(dt: datetime | None = None) -> bool:
     dt = dt or now_dt()
     t = dt.time()
-    # 跨天时间段：20:00 - 23:59 或 00:00 - 12:00
+    return t >= CHECK_START or t <= CHECK_END
+
+
+def in_formal_work_hours(dt: datetime | None = None) -> bool:
+    dt = dt or now_dt()
+    t = dt.time()
     return t >= WORK_START or t <= WORK_END
 
 
@@ -274,6 +279,12 @@ def extract_action(text: str):
     text = normalize_text(text)
 
     button_map = {
+        "🟢 上班 on": "上班",
+        "🔴 下班 off": "下班",
+        "🍚 吃饭 eat": "吃饭",
+        "🚽 上厕所 toilet": "上厕所",
+        "🚬 抽烟 smoke": "抽烟",
+        "✅ 回座 back": "回座",
         "上班 on": "上班",
         "下班 off": "下班",
         "吃饭 eat": "吃饭",
@@ -293,7 +304,7 @@ def extract_action(text: str):
 
 def is_return_text(text: str) -> bool:
     text = normalize_text(text)
-    if text == "回座 back":
+    if text in {"回座 back", "✅ 回座 back"}:
         return True
     return any(contains_phrase(text, word) for word in RETURN_WORDS)
 
@@ -675,7 +686,7 @@ def get_records(chat_id: int, period_key: str):
 # =========================
 def format_stats(rows, period_key: str):
     if not rows:
-        return f"📅 <b>{period_key} 周期离岗统计</b>\n\n暂无记录。"
+        return f"📅 <b>{period_key} 周期离岗统计 / Break Summary</b>\n\n暂无记录 / No records."
 
     grouped = defaultdict(dict)
     for row in rows:
@@ -684,31 +695,31 @@ def format_stats(rows, period_key: str):
             "seconds": row["total_seconds"],
         }
 
-    lines = [f"📅 <b>{period_key} 周期离岗统计</b>\n"]
+    lines = [f"📅 <b>{period_key} 周期离岗统计 / Break Summary</b>\n"]
     for name, data in grouped.items():
         lines.append(f"👤 <b>{safe_text(name)}</b>")
         for action in BREAK_ACTIONS:
             item = data.get(action, {"count": 0, "seconds": 0})
-            lines.append(f"• {action}：{item['count']} 次，合计 {format_seconds(item['seconds'])}")
+            lines.append(f"• {action}：{item['count']} 次 / times，合计 {format_seconds(item['seconds'])}")
         lines.append("")
     return "\n".join(lines).strip()
 
 
 def format_attendance(rows, period_key: str):
     if not rows:
-        return f"🕘 <b>{period_key} 周期上下班</b>\n\n暂无记录。"
+        return f"🕘 <b>{period_key} 周期上下班 / Attendance</b>\n\n暂无记录 / No records."
 
-    lines = [f"🕘 <b>{period_key} 周期上下班</b>\n"]
+    lines = [f"🕘 <b>{period_key} 周期上下班 / Attendance</b>\n"]
     for row in rows:
         on_show = row["on_duty_time"][11:19] if row["on_duty_time"] else "-"
         off_show = row["off_duty_time"][11:19] if row["off_duty_time"] else "-"
-        status_show = "在岗" if row["status"] == "on" else "已下班/离岗"
+        status_show = "在岗 / On duty" if row["status"] == "on" else "已下班/离岗 / Off duty"
         lines.append(
             f"👤 <b>{safe_text(row['full_name'])}</b>\n"
-            f"• 上班：{on_show}\n"
-            f"• 下班：{off_show}\n"
-            f"• 上班时长：{format_seconds(row['work_seconds'] or 0)}\n"
-            f"• 状态：{status_show}\n"
+            f"• 上班 / On：{on_show}\n"
+            f"• 下班 / Off：{off_show}\n"
+            f"• 上班时长 / Work time：{format_seconds(row['work_seconds'] or 0)}\n"
+            f"• 状态 / Status：{status_show}\n"
         )
     return "\n".join(lines).strip()
 
@@ -717,25 +728,25 @@ def format_me(full_name: str, per_action: dict, total_count: int, total_seconds:
     on_show = "-"
     off_show = "-"
     work_seconds = 0
-    status_show = "未上班"
+    status_show = "未上班 / Not on duty"
 
     if attendance:
         on_show = attendance["on_duty_time"][11:19] if attendance["on_duty_time"] else "-"
         off_show = attendance["off_duty_time"][11:19] if attendance["off_duty_time"] else "-"
         work_seconds = attendance["work_seconds"] or 0
-        status_show = "在岗" if attendance["status"] == "on" else "已下班"
+        status_show = "在岗 / On duty" if attendance["status"] == "on" else "已下班 / Off duty"
 
     return (
-        f"👤 <b>{safe_text(full_name)} - {period_key} 我的离岗明细</b>\n\n"
-        f"🕘 上班：{on_show}\n"
-        f"🕘 下班：{off_show}\n"
-        f"⏱ 上班时长：{format_seconds(work_seconds)}\n"
-        f"📊 离岗总次数：{total_count} 次\n"
-        f"⌛ 离岗总时长：{format_seconds(total_seconds)}\n\n"
-        f"🍚 吃饭：{per_action['吃饭']['count']} 次，{format_seconds(per_action['吃饭']['seconds'])}\n"
-        f"🚽 上厕所：{per_action['上厕所']['count']} 次，{format_seconds(per_action['上厕所']['seconds'])}\n"
-        f"🚬 抽烟：{per_action['抽烟']['count']} 次，{format_seconds(per_action['抽烟']['seconds'])}\n"
-        f"📍 当前状态：{status_show}"
+        f"👤 <b>{safe_text(full_name)} - {period_key} 我的离岗明细 / My Break Summary</b>\n\n"
+        f"🕘 上班 / On：{on_show}\n"
+        f"🕘 下班 / Off：{off_show}\n"
+        f"⏱ 上班时长 / Work time：{format_seconds(work_seconds)}\n"
+        f"📊 离岗总次数 / Total breaks：{total_count} 次\n"
+        f"⌛ 离岗总时长 / Total break time：{format_seconds(total_seconds)}\n\n"
+        f"🍚 吃饭 / Eat：{per_action['吃饭']['count']} 次，{format_seconds(per_action['吃饭']['seconds'])}\n"
+        f"🚽 上厕所 / Toilet：{per_action['上厕所']['count']} 次，{format_seconds(per_action['上厕所']['seconds'])}\n"
+        f"🚬 抽烟 / Smoke：{per_action['抽烟']['count']} 次，{format_seconds(per_action['抽烟']['seconds'])}\n"
+        f"📍 当前状态 / Status：{status_show}"
     )
 
 
@@ -835,7 +846,7 @@ async def get_admin_mentions(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -
         if u.is_bot:
             continue
         items.append(mention_html(u.id, u.username or "", u.full_name or str(u.id)))
-    return " ".join(items) if items else "管理员"
+    return " ".join(items) if items else "管理员 / Admins"
 
 
 # =========================
@@ -882,7 +893,7 @@ async def auto_export_job(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_document(
         chat_id=chat_id,
         document=InputFile(bio, filename=filename),
-        caption=f"📄 {period_key} 打卡记录已自动导出",
+        caption=f"📄 {period_key} 打卡记录已自动导出 / Report exported automatically",
         reply_markup=get_main_keyboard(),
     )
 
@@ -906,8 +917,8 @@ async def absence_check_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (
-        f"🚨 <b>21:10 未打上班卡名单（已登记成员）</b>\n\n"
-        f"周期：<b>{period_key}</b>\n"
+        f"🚨 <b>21:10 未打上班卡名单 / Missing Check-in List</b>\n\n"
+        f"周期 / Period：<b>{period_key}</b>\n"
         + "\n".join(missing)
     )
     await context.bot.send_message(
@@ -938,10 +949,10 @@ async def timeout_warning_job(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
-            f"⚠️ <b>即将超时提醒</b>\n\n"
+            f"⚠️ <b>即将超时提醒 / Timeout Warning</b>\n\n"
             f"{safe_text(mention)}\n"
-            f"项目：<b>{action}</b>\n"
-            f"请尽快回座并发送：<b>回座 / BACK / done</b>"
+            f"项目 / Action：<b>{action}</b>\n"
+            f"请尽快回座 / Please return and send：<b>回座 / BACK / done</b>"
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=get_main_keyboard(),
@@ -970,10 +981,10 @@ async def timeout_over_job(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
-            f"🚨 <b>离岗超时</b>\n\n"
+            f"🚨 <b>离岗超时 / Break Timeout</b>\n\n"
             f"{safe_text(mention)}\n"
-            f"项目：<b>{action}</b>\n"
-            f"已超过 <b>{timeout_minutes}</b> 分钟\n\n"
+            f"项目 / Action：<b>{action}</b>\n"
+            f"已超过 / Exceeded：<b>{timeout_minutes}</b> 分钟\n\n"
             f"{admins}"
         ),
         parse_mode=ParseMode.HTML,
@@ -994,15 +1005,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_scheduled_for_chat(context.application, chat.id)
 
     msg = (
-        "<b>泰国时间企业打卡机器人</b>\n\n"
-        "功能：\n"
-        "• 上班可打卡时间：20:00 - 次日12:00（泰国时间）\n"
-        "• 每天中午12:00自动导出上一周期表格\n"
-        "• 每晚21:10自动提醒未打上班卡成员（已登记成员）\n"
-        "• 吃饭15分钟 / 上厕所10分钟 / 抽烟10分钟\n"
-        "• 快超时先提醒本人，超时后 @管理员\n"
-        "• 导出按钮仅管理员可用\n\n"
-        "命令：\n"
+        "<b>✨ 泰国时间企业打卡机器人 / Thailand Enterprise Check-in Bot</b>\n\n"
+        "<b>时间规则 / Time Rules</b>\n"
+        "• 可打卡时间 / Allowed check-in：20:00 - 次日12:00\n"
+        "• 正式上下班时间 / Formal work hours：21:00 - 次日10:00\n"
+        "• 每天12:00自动导出上一周期 / Auto export at 12:00\n"
+        "• 每晚21:10检查未打卡 / Missing check-in check at 21:10\n\n"
+        "<b>离岗规则 / Break Rules</b>\n"
+        "• 吃饭 Eat：15分钟\n"
+        "• 上厕所 Toilet：10分钟\n"
+        "• 抽烟 Smoke：10分钟\n"
+        "• 快超时提醒本人 / Warn before timeout\n"
+        "• 超时后 @管理员 / Mention admins after timeout\n\n"
+        "<b>命令 / Commands</b>\n"
         "/today 查看本周期离岗统计\n"
         "/attendance 查看本周期上下班\n"
         "/me 查看我的离岗次数和时长\n"
@@ -1041,13 +1056,14 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     ensure_default_settings(chat_id)
     lines = [
-        "<b>当前配置</b>\n",
-        "时区：Asia/Bangkok",
-        f"上班可打卡时间：{WORK_START.strftime('%H:%M')} - 次日{WORK_END.strftime('%H:%M')}",
-        f"周期切换：每天 {RESET_TIME.strftime('%H:%M')}",
-        f"未打卡检查：每天 {ABSENCE_CHECK_TIME.strftime('%H:%M')}",
-        f"导出仅管理员：{'开启' if EXPORT_ADMIN_ONLY else '关闭'}\n",
-        "离岗时限：",
+        "<b>当前配置 / Current Settings</b>\n",
+        "时区 / Timezone：Asia/Bangkok",
+        f"可打卡时间 / Allowed check-in：{CHECK_START.strftime('%H:%M')} - 次日{CHECK_END.strftime('%H:%M')}",
+        f"正式上下班时间 / Formal work hours：{WORK_START.strftime('%H:%M')} - 次日{WORK_END.strftime('%H:%M')}",
+        f"周期切换 / Reset cycle：每天 {RESET_TIME.strftime('%H:%M')}",
+        f"未打卡检查 / Missing check-in：每天 {ABSENCE_CHECK_TIME.strftime('%H:%M')}",
+        f"导出仅管理员 / Export admin only：{'开启 / ON' if EXPORT_ADMIN_ONLY else '关闭 / OFF'}\n",
+        "离岗时限 / Break limits：",
     ]
     for action in BREAK_ACTIONS:
         lines.append(f"• {action}：{get_timeout(chat_id, action)} 分钟")
@@ -1056,7 +1072,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if EXPORT_ADMIN_ONLY and not await is_group_admin(update, context):
-        await send_reply(update, "只有管理员可以导出日报。")
+        await send_reply(update, "只有管理员可以导出日报 / Only admins can export reports.")
         return
 
     period_key = current_period_key()
@@ -1066,7 +1082,7 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.effective_chat.send_document(
         document=InputFile(bio, filename=filename),
-        caption=f"📄 {period_key} 打卡日报",
+        caption=f"📄 {period_key} 打卡日报 / Report exported",
         reply_markup=get_main_keyboard(),
     )
 
@@ -1078,11 +1094,11 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     row = get_open_checkin(chat_id, user_id, period_key)
     if not row:
-        await send_reply(update, "你当前没有进行中的离岗。")
+        await send_reply(update, "你当前没有进行中的离岗 / No active break record.")
         return
 
     cancel_checkin(row["id"])
-    await send_reply(update, f"已取消当前离岗：{row['action']}")
+    await send_reply(update, f"已取消当前离岗 / Break cancelled：{row['action']}")
 
 
 # =========================
@@ -1107,7 +1123,7 @@ async def process_action(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
     if is_return_text(text):
         open_row = get_open_checkin(chat_id, user_id, period_key)
         if not open_row:
-            await send_reply(update, "你当前没有进行中的离岗。")
+            await send_reply(update, "你当前没有进行中的离岗 / No active break record.")
             return
 
         end_dt = now_dt()
@@ -1119,13 +1135,13 @@ async def process_action(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
         await send_reply(
             update,
             (
-                f"✅ <b>回座成功</b>\n\n"
+                f"✅ <b>回座成功 / BACK TO WORK</b>\n\n"
                 f"👤 {safe_text(full_name)}\n"
-                f"📌 项目：{open_row['action']}\n"
-                f"🕒 本次离岗时长：{format_seconds(seconds)}\n"
-                f"📊 本周期离岗总次数：{total_count} 次\n"
-                f"⌛ 本周期离岗总时长：{format_seconds(total_seconds)}\n"
-                f"📍 回座时间：{fmt_dt(end_dt)}"
+                f"📌 项目 / Action：{open_row['action']}\n"
+                f"🕒 本次离岗时长 / This break：{format_seconds(seconds)}\n"
+                f"📊 本周期离岗总次数 / Total breaks：{total_count} 次\n"
+                f"⌛ 本周期离岗总时长 / Total break time：{format_seconds(total_seconds)}\n"
+                f"📍 回座时间 / Back time：{fmt_dt(end_dt)}"
             ),
         )
         return
@@ -1134,29 +1150,37 @@ async def process_action(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
     if not action:
         return
 
-    # 上下班时间限制
-    if action in ["上班", "下班"] and not in_working_hours():
+    # 上下班允许打卡时间限制
+    if action in ["上班", "下班"] and not in_checkin_hours():
         await send_reply(
             update,
-            f"当前不在上/下班打卡时间内。\n允许时间：{WORK_START.strftime('%H:%M')} - 次日{WORK_END.strftime('%H:%M')}（泰国时间）"
+            "❌ <b>当前不在可打卡时间 / Not in allowed check-in time</b>\n\n"
+            "🕒 允许时间 / Allowed time：20:00 - 次日12:00 (TH)",
         )
         return
 
     # 上班
     if action == "上班":
         if is_on_duty(chat_id, user_id, period_key):
-            await send_reply(update, "你本周期已经是上班状态。")
+            await send_reply(update, "你本周期已经是上班状态 / You are already on duty.")
             return
 
         now = now_dt()
         create_or_update_on_duty(chat_id, user_id, username, full_name, now.isoformat(), period_key)
+
+        warning = ""
+        if not in_formal_work_hours():
+            warning = "\n⚠️ 非正式上班时间 / Non-formal work hours (21:00 - 10:00)"
+
         await send_reply(
             update,
             (
-                f"🟢 <b>上班打卡成功</b>\n\n"
+                f"🟢 <b>上班成功 / ON DUTY</b>\n\n"
                 f"👤 {safe_text(full_name)}\n"
-                f"🕒 上班时间：{fmt_dt(now)}\n"
-                f"📅 周期：{period_key}"
+                f"🕒 时间 / Time：{fmt_dt(now)}\n"
+                f"📅 周期 / Period：{period_key}\n"
+                f"⏰ 正式时间 / Formal work hours：21:00 - 次日10:00"
+                f"{warning}"
             ),
         )
         return
@@ -1164,12 +1188,12 @@ async def process_action(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
     # 下班
     if action == "下班":
         if not is_on_duty(chat_id, user_id, period_key):
-            await send_reply(update, "你当前不是上班状态，无法下班打卡。")
+            await send_reply(update, "你当前不是上班状态 / You are not on duty.")
             return
 
         open_row = get_open_checkin(chat_id, user_id, period_key)
         if open_row:
-            await send_reply(update, f"你还有未结束离岗：{open_row['action']}\n请先发送：回座 / BACK / done")
+            await send_reply(update, f"你还有未结束离岗 / Unfinished break：{open_row['action']}\n请先发送 / Please send：回座 / BACK / done")
             return
 
         att = get_attendance(chat_id, user_id, period_key)
@@ -1184,15 +1208,15 @@ async def process_action(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
         await send_reply(
             update,
             (
-                f"🔴 <b>下班打卡成功</b>\n\n"
+                f"🔴 <b>下班成功 / OFF DUTY</b>\n\n"
                 f"👤 {safe_text(full_name)}\n"
-                f"🕒 下班时间：{fmt_dt(now)}\n"
-                f"⏱ 本周期上班时长：{format_seconds(work_seconds)}\n"
-                f"📊 本周期离岗总次数：{total_count} 次\n"
-                f"🧾 吃饭：{per_action['吃饭']['count']} 次，{format_seconds(per_action['吃饭']['seconds'])}\n"
-                f"🧾 上厕所：{per_action['上厕所']['count']} 次，{format_seconds(per_action['上厕所']['seconds'])}\n"
-                f"🧾 抽烟：{per_action['抽烟']['count']} 次，{format_seconds(per_action['抽烟']['seconds'])}\n"
-                f"⌛ 本周期离岗总时长：{format_seconds(total_seconds)}"
+                f"🕒 时间 / Time：{fmt_dt(now)}\n"
+                f"⏱ 本周期上班时长 / Work time：{format_seconds(work_seconds)}\n"
+                f"📊 本周期离岗总次数 / Total breaks：{total_count} 次\n"
+                f"🧾 吃饭 / Eat：{per_action['吃饭']['count']} 次，{format_seconds(per_action['吃饭']['seconds'])}\n"
+                f"🧾 上厕所 / Toilet：{per_action['上厕所']['count']} 次，{format_seconds(per_action['上厕所']['seconds'])}\n"
+                f"🧾 抽烟 / Smoke：{per_action['抽烟']['count']} 次，{format_seconds(per_action['抽烟']['seconds'])}\n"
+                f"⌛ 本周期离岗总时长 / Total break time：{format_seconds(total_seconds)}"
             ),
         )
         return
@@ -1200,12 +1224,12 @@ async def process_action(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
     # 离岗
     if action in BREAK_ACTIONS:
         if not is_on_duty(chat_id, user_id, period_key):
-            await send_reply(update, "请先上班打卡，再进行离岗打卡。")
+            await send_reply(update, "请先上班打卡 / Please check in first.")
             return
 
         open_row = get_open_checkin(chat_id, user_id, period_key)
         if open_row:
-            await send_reply(update, f"你当前还有未结束离岗：{open_row['action']}\n请先发送：回座 / BACK / done")
+            await send_reply(update, f"你当前还有未结束离岗 / Active break：{open_row['action']}\n请先发送 / Please send：回座 / BACK / done")
             return
 
         previous_count = get_action_count(chat_id, user_id, action, period_key)
@@ -1260,15 +1284,16 @@ async def process_action(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
         await send_reply(
             update,
             (
-                f"🟡 <b>离岗成功</b>\n\n"
+                f"🟡 <b>离岗成功 / BREAK STARTED</b>\n\n"
                 f"👤 {safe_text(full_name)}\n"
-                f"📌 项目：{action}\n"
-                f"🕒 开始时间：{fmt_dt(start_dt)}\n"
-                f"🔢 本周期该项目第 {current_count} 次\n"
-                f"📊 本周期离岗总次数：{total_break_count + 1} 次（含本次进行中）\n"
-                f"⌛ 已完成离岗总时长：{format_seconds(total_break_seconds)}\n"
-                f"⏰ 超时上限：{timeout_minutes} 分钟\n\n"
-                f"完成后请发送：<b>回座 / BACK / done</b>"
+                f"📌 项目 / Action：{action}\n"
+                f"🕒 开始 / Start：{fmt_dt(start_dt)}\n"
+                f"🔢 本周期该项目第 / This action count：{current_count} 次\n"
+                f"📊 本周期离岗总次数 / Total breaks：{total_break_count + 1} 次（含本次进行中）\n"
+                f"⌛ 已完成离岗总时长 / Completed break time：{format_seconds(total_break_seconds)}\n"
+                f"⏰ 超时上限 / Limit：{timeout_minutes} 分钟\n"
+                f"⚠️ 超时将提醒管理员 / Admins will be mentioned after timeout\n\n"
+                f"👉 返回 / Return：<b>回座 / BACK / done</b>"
             ),
         )
         return
