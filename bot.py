@@ -96,7 +96,7 @@ ACTION_KEYWORDS = {
 RETURN_WORDS = [
     "回座", "已回座", "回到座位", "回来了", "到座",
     "back", "im back", "i'm back", "iam back", "returned",
-    "return", "done", "finish", "finished", "ok", "okay",
+    "return", "done", "finish", "finished",
 ]
 
 
@@ -107,15 +107,15 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton("🟢 上班 On"), KeyboardButton("🔴 下班 Off")],
-            [KeyboardButton("🍚 吃饭 Eat"), KeyboardButton("🚽 厕所 Toilet")],
-            [KeyboardButton("🚬 抽烟 Smoke"), KeyboardButton("✅ 回座 Back")],
+            [KeyboardButton("🍚 吃饭 Eat"), KeyboardButton("🚽 厕所 Toilet"), KeyboardButton("🚬 抽烟 Smoke")],
+            [KeyboardButton("✅ 回座 Back")],
             [KeyboardButton("📊 我的 /me"), KeyboardButton("📅 今日 /today")],
             [KeyboardButton("🕘 出勤 /attendance"), KeyboardButton("📤 导出 /export")],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
         selective=False,
-        input_field_placeholder="请选择按钮或直接输入 / Choose a button or type",
+        input_field_placeholder="请选择操作 / Choose an action",
     )
 
 
@@ -300,12 +300,27 @@ def normalize_text(text: str) -> str:
     return text
 
 
+def tokenize(text: str) -> list[str]:
+    text = normalize_text(text)
+    return text.split() if text else []
+
+
 def contains_phrase(text: str, phrase: str) -> bool:
-    return normalize_text(phrase) in normalize_text(text)
+    text_tokens = tokenize(text)
+    phrase_tokens = tokenize(phrase)
+
+    if not phrase_tokens or not text_tokens:
+        return False
+
+    n = len(phrase_tokens)
+    for i in range(len(text_tokens) - n + 1):
+        if text_tokens[i:i + n] == phrase_tokens:
+            return True
+    return False
 
 
 def extract_action(text: str):
-    text = normalize_text(text)
+    norm = normalize_text(text)
 
     button_map = {
         "🟢 上班 on": "上班",
@@ -322,19 +337,19 @@ def extract_action(text: str):
         "抽烟 smoke": "抽烟",
         "回座 back": "回座",
     }
-    if text in button_map:
-        return button_map[text]
+    if norm in button_map:
+        return button_map[norm]
 
     for action, words in ACTION_KEYWORDS.items():
         for word in words:
-            if contains_phrase(text, word):
+            if contains_phrase(norm, word):
                 return action
     return None
 
 
 def is_return_text(text: str) -> bool:
-    text = normalize_text(text)
-    return any(contains_phrase(text, word) for word in RETURN_WORDS)
+    norm = normalize_text(text)
+    return any(contains_phrase(norm, word) for word in RETURN_WORDS)
 
 
 def safe_text(text: str) -> str:
@@ -1145,6 +1160,31 @@ async def resetall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
+# 快捷按钮映射
+# =========================
+async def handle_quick_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    norm = normalize_text(text)
+
+    if norm in {"📊 我的 me", "我的 me", "me"}:
+        await me_command(update, context)
+        return True
+
+    if norm in {"📅 今日 today", "今日 today", "today"}:
+        await today_command(update, context)
+        return True
+
+    if norm in {"🕘 出勤 attendance", "出勤 attendance", "attendance"}:
+        await attendance_command(update, context)
+        return True
+
+    if norm in {"📤 导出 export", "导出 export", "export"}:
+        await export_command(update, context)
+        return True
+
+    return False
+
+
+# =========================
 # 核心逻辑
 # =========================
 async def process_action(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
@@ -1369,12 +1409,18 @@ async def process_action(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
+
     chat = update.effective_chat
     user = update.effective_user
     ensure_chat(chat.id, chat.title or chat.full_name or str(chat.id), chat.type)
     ensure_member(chat.id, user)
 
     text = (update.message.text or "").strip()
+
+    handled = await handle_quick_buttons(update, context, text)
+    if handled:
+        return
+
     await process_action(update, context, text)
 
 
