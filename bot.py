@@ -269,10 +269,9 @@ def seconds_between(start_iso: str, end_iso: str) -> int:
 # =========================
 def normalize_text(text: str) -> str:
     text = (text or "").strip().lower()
-    text = text.replace("’", "'")
-    text = text.replace("`", "'")
-    text = re.sub(r"[_\\-.,!?;:，。！？；：/\\\\()\\[\\]{}]+", " ", text)
-    text = re.sub(r"\\s+", " ", text).strip()
+    text = text.replace("’", "'").replace("`", "'")
+    text = re.sub(r"[-_.,!?;:，。！？；：/\\()\\[\\]{}]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
